@@ -18,7 +18,7 @@ Key Innovation:
 import asyncio
 import time
 from pathlib import Path
-from typing import Dict, Any, Callable, List, Tuple
+from typing import Dict, Any, Callable, List, Tuple, Union
 from datetime import datetime
 import cv2
 
@@ -105,7 +105,7 @@ class OrchestratorAgent(BaseAgent):
         self,
         planning_log: PlanningLog,
         test_output: TestOutput,
-        video_path: Path,
+        video_paths: Union[List[Path], Path],
         temp_dir: Path,
         progress_callback: Callable[[TaskProgress], None] = None
     ) -> DeviationReport:
@@ -115,17 +115,25 @@ class OrchestratorAgent(BaseAgent):
         Args:
             planning_log: Parsed planning log
             test_output: Parsed test output
-            video_path: Path to video file
+            video_paths: Path to video file(s) - can be a single Path or list of Paths
             temp_dir: Temporary directory for frames
             progress_callback: Optional callback for progress updates
             
         Returns:
             Complete deviation report with metrics
         """
+        # Normalize to list for consistent handling
+        if isinstance(video_paths, Path):
+            video_paths = [video_paths]
         overall_start = time.time()
         all_metrics: List[AgentMetrics] = []
         self.progress_callback = progress_callback
         current_progress = 0.0
+        
+        # Detect Audit Mode from metadata
+        is_audit = planning_log.metadata.get('is_audit_mode', False)
+        if is_audit:
+            self.logger.info("🛡️ AUDIT MODE ACTIVATED: Verifying agent reporting accuracy")
         
         try:
             # Phase 1: Planning (5%)
@@ -143,7 +151,9 @@ class OrchestratorAgent(BaseAgent):
                 phase_start = time.time()
                 llm_start = self.planning_agent.llm_calls
                 
-                video_duration = self._get_video_duration(video_path)
+                # Calculate total duration across all videos
+                video_duration = sum(self._get_video_duration(vp) for vp in video_paths)
+                self.logger.info(f"Total video duration across {len(video_paths)} video(s): {video_duration:.2f}s")
                 strategy = await self.planning_agent.create_strategy(planning_log, video_duration)
                 
                 planning_metrics = self.planning_agent.create_metrics(
@@ -167,7 +177,7 @@ class OrchestratorAgent(BaseAgent):
             with self.timed_operation("Frame Extraction"):
                 phase_start = time.time()
                 all_frames = await asyncio.to_thread(
-                    self._extract_frames, video_path, temp_dir, strategy
+                    self._extract_frames_from_multiple_videos, video_paths, temp_dir, strategy
                 )
                 
                 extraction_metrics = self.create_metrics(
@@ -176,7 +186,7 @@ class OrchestratorAgent(BaseAgent):
                     llm_calls=0
                 )
                 all_metrics.append(extraction_metrics)
-                self.logger.info(f"Extracted {len(all_frames)} frames")
+                self.logger.info(f"Extracted {len(all_frames)} frames from {len(video_paths)} video(s)")
             
             # Phase 3: Select Key Frames (20%)
             current_progress = 0.20
@@ -362,7 +372,8 @@ class OrchestratorAgent(BaseAgent):
                     steps=planning_log.steps,
                     timeline=timeline,
                     ocr_data=ocr_data,
-                    progress_callback=verification_progress_callback
+                    progress_callback=verification_progress_callback,
+                    is_audit=is_audit
                 )
                 
                 verification_metrics = self.verification_agent.create_metrics(
@@ -433,7 +444,8 @@ class OrchestratorAgent(BaseAgent):
         steps: List[TestStep],
         timeline: VideoTimeline,
         ocr_data: Dict[int, List[str]],
-        progress_callback: Callable = None
+        progress_callback: Callable = None,
+        is_audit: bool = False
     ) -> List[VerificationResult]:
         """
         Smart verification with LLM triage.
@@ -450,6 +462,7 @@ class OrchestratorAgent(BaseAgent):
             timeline: Video timeline from comprehensive analysis
             ocr_data: OCR results by frame number
             progress_callback: Progress update callback
+            is_audit: Whether to run in Audit Mode
             
         Returns:
             List of verification results for all steps
@@ -485,9 +498,10 @@ class OrchestratorAgent(BaseAgent):
         code_based: List[Tuple[TestStep, StepEvidence]] = []
         
         for step, evidence in initial_evidence:
-            if self.verification_agent.needs_llm_verification(step, evidence):
+            # In Audit Mode, we ALWAYS use LLM for now to ensure reporting accuracy is checked deeply
+            if is_audit or self.verification_agent.needs_llm_verification(step, evidence):
                 needs_llm.append((step, evidence))
-                self.logger.info(f"   ⚡ Step {step.step_number}: Flagged for LLM verification")
+                self.logger.info(f"   ⚡ Step {step.step_number}: Flagged for LLM {'audit' if is_audit else 'verification'}")
             else:
                 code_based.append((step, evidence))
                 self.logger.info(f"   ✓ Step {step.step_number}: Code-based verification sufficient")
@@ -509,7 +523,7 @@ class OrchestratorAgent(BaseAgent):
                 # Async per-step verification
                 self.logger.info("   Mode: Async per-step (< 5 steps)")
                 llm_results = await self._verify_steps_async(
-                    needs_llm, code_results, timeline.narrative, progress_callback
+                    needs_llm, code_results, timeline.narrative, progress_callback, is_audit=is_audit
                 )
             else:
                 # Batch verification
@@ -517,7 +531,8 @@ class OrchestratorAgent(BaseAgent):
                 llm_results = await self.verification_agent.batch_verify_steps(
                     steps_to_verify=needs_llm,
                     previous_results=code_results,
-                    timeline_narrative=timeline.narrative
+                    timeline_narrative=timeline.narrative,
+                    is_audit=is_audit
                 )
         
         # Step 5: Merge and order results by step number
@@ -544,7 +559,8 @@ class OrchestratorAgent(BaseAgent):
         steps_to_verify: List[Tuple[TestStep, StepEvidence]],
         previous_results: List[VerificationResult],
         timeline_narrative: str,
-        progress_callback: Callable = None
+        progress_callback: Callable = None,
+        is_audit: bool = False
     ) -> List[VerificationResult]:
         """
         Verify steps asynchronously, one at a time.
@@ -567,7 +583,8 @@ class OrchestratorAgent(BaseAgent):
                 step=step,
                 evidence=evidence,
                 previous_results=accumulated_results,
-                timeline_narrative=timeline_narrative
+                timeline_narrative=timeline_narrative,
+                is_audit=is_audit
             )
             
             results.append(result)
@@ -611,34 +628,119 @@ class OrchestratorAgent(BaseAgent):
             notes="Code-based verification (no LLM)"
         )
     
-    def _extract_frames(self, video_path: Path, temp_dir: Path, strategy) -> List[VideoFrame]:
-        """Extract frames from video based on strategy."""
-        frames = []
+    def _extract_frames_from_multiple_videos(
+        self, video_paths: List[Path], temp_dir: Path, strategy
+    ) -> List[VideoFrame]:
+        """Extract frames from multiple videos sequentially.
+        
+        Args:
+            video_paths: List of paths to video files
+            temp_dir: Temporary directory for frames
+            strategy: Strategy containing frame_interval and max_frames
+            
+        Returns:
+            Combined list of VideoFrame objects with continuous timestamps
+        """
+        all_frames = []
         frames_dir = temp_dir / "frames"
         frames_dir.mkdir(exist_ok=True)
+        
+        # Calculate max frames per video to distribute evenly
+        max_frames_per_video = strategy.max_frames // len(video_paths)
+        # Give extra frames to last video if there's a remainder
+        remainder_frames = strategy.max_frames % len(video_paths)
+        
+        cumulative_timestamp = 0.0  # Track timestamp across videos
+        global_frame_number = 0  # Track frame number across all videos
+        
+        for video_idx, video_path in enumerate(video_paths):
+            # Determine max frames for this video
+            video_max_frames = max_frames_per_video
+            if video_idx == len(video_paths) - 1:
+                video_max_frames += remainder_frames
+            
+            self.logger.info(f"Extracting up to {video_max_frames} frames from video {video_idx + 1}/{len(video_paths)}: {video_path.name}")
+            
+            frames = self._extract_frames_single_video(
+                video_path=video_path,
+                frames_dir=frames_dir,
+                strategy=strategy,
+                max_frames=video_max_frames,
+                timestamp_offset=cumulative_timestamp,
+                frame_number_offset=global_frame_number,
+                video_index=video_idx
+            )
+            
+            all_frames.extend(frames)
+            
+            # Update cumulative timestamp and frame number for next video
+            if frames:
+                cumulative_timestamp = frames[-1].timestamp + 1.0  # Add 1 second gap between videos
+                global_frame_number = frames[-1].frame_number + 1
+            
+            # Also update with actual video duration
+            video_duration = self._get_video_duration(video_path)
+            cumulative_timestamp = max(cumulative_timestamp, cumulative_timestamp + video_duration)
+        
+        self.logger.info(f"Total frames extracted: {len(all_frames)} from {len(video_paths)} video(s)")
+        return all_frames
+    
+    def _extract_frames_single_video(
+        self,
+        video_path: Path,
+        frames_dir: Path,
+        strategy,
+        max_frames: int,
+        timestamp_offset: float = 0.0,
+        frame_number_offset: int = 0,
+        video_index: int = 0
+    ) -> List[VideoFrame]:
+        """Extract frames from a single video.
+        
+        Args:
+            video_path: Path to video file
+            frames_dir: Directory to save frames
+            strategy: Strategy containing frame_interval
+            max_frames: Maximum frames to extract from this video
+            timestamp_offset: Offset to add to timestamps (for multi-video continuity)
+            frame_number_offset: Offset for frame numbering (for multi-video continuity)
+            video_index: Index of this video in the sequence (for filename prefixing)
+            
+        Returns:
+            List of VideoFrame objects for this video
+        """
+        frames = []
         
         cap = cv2.VideoCapture(str(video_path))
         fps = cap.get(cv2.CAP_PROP_FPS)
         
-        frame_interval = int(fps * strategy.frame_interval)
+        if fps <= 0:
+            self.logger.warning(f"Invalid FPS ({fps}) for video {video_path.name}, defaulting to 30")
+            fps = 30.0
+        
+        frame_interval = max(1, int(fps * strategy.frame_interval))
         frame_count = 0
         saved_count = 0
         
-        while cap.isOpened() and saved_count < strategy.max_frames:
+        while cap.isOpened() and saved_count < max_frames:
             ret, frame = cap.read()
             if not ret:
                 break
             
             if frame_count % frame_interval == 0:
-                timestamp = frame_count / fps
-                frame_filename = f"frame_{saved_count:04d}_{timestamp:.3f}s.jpg"
+                local_timestamp = frame_count / fps
+                global_timestamp = timestamp_offset + local_timestamp
+                global_frame_number = frame_number_offset + saved_count
+                
+                # Include video index in filename for clarity
+                frame_filename = f"v{video_index}_frame_{global_frame_number:04d}_{global_timestamp:.3f}s.jpg"
                 frame_path = frames_dir / frame_filename
                 
                 cv2.imwrite(str(frame_path), frame)
                 
                 frames.append(VideoFrame(
-                    frame_number=saved_count,
-                    timestamp=timestamp,
+                    frame_number=global_frame_number,
+                    timestamp=global_timestamp,
                     frame_path=str(frame_path)
                 ))
                 
@@ -648,6 +750,10 @@ class OrchestratorAgent(BaseAgent):
         
         cap.release()
         return frames
+    
+    def _extract_frames(self, video_path: Path, temp_dir: Path, strategy) -> List[VideoFrame]:
+        """Extract frames from a single video based on strategy (backward compatibility)."""
+        return self._extract_frames_from_multiple_videos([video_path], temp_dir, strategy)
     
     def _get_video_duration(self, video_path: Path) -> float:
         """Get video duration in seconds."""

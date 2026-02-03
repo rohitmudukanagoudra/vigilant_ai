@@ -7,15 +7,6 @@
 <p align="center">
   <strong>AI-Powered Test Verification System</strong><br>
 </p>
-
-<p align="center">
-  <a href="#key-features">Features</a> •
-  <a href="#installation">Installation</a> •
-  <a href="#quick-start">Quick Start</a> •
-  <a href="#architecture">Architecture</a> •
-  <a href="#configuration">Configuration</a>
-</p>
-
 ---
 
 ## 🎯 Overview
@@ -45,6 +36,7 @@ This catches **false positives** where tests pass but the actual UI behavior dev
 | 📹 **Multiple Video Support** | Upload and analyze multiple video recordings in a single session. Frames are extracted sequentially with continuous timestamps. |
 | 🧠 **Smart Triage** | Intelligent decision on when LLM verification is needed vs code-based matching. |
 | 🔌 **Modular LLM Provider** | Factory pattern allows swapping between Gemini, CLI, or open-source models. |
+| 🛡️ **Smart Audit Mode** | Automatically detects when "Planning Logs" contain agent observations and switches to auditing mode to verify agent accuracy. |
 | 📊 **Multi-format Reports** | Generate reports in JSON, HTML (styled), and Markdown formats. |
 
 ---
@@ -60,7 +52,7 @@ This catches **false positives** where tests pass but the actual UI behavior dev
 
 1. **Clone the repository**
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/rohitmudukanagoudra/vigilant_ai.git
    cd analysis_agent
    ```
 
@@ -109,7 +101,8 @@ API documentation: `http://localhost:8000/docs`
 ### Basic Usage
 
 1. Upload your test video recording(s) - **multiple videos are supported**
-2. Provide the test planning log (expected steps)
+2. Provide the test planning log (expected steps). 
+   - **Smart Auditor**: If the log contains agent observations/outcomes, Vigilant AI automatically enters **Audit Mode** to verify the reporting accuracy of your automation agent.
 3. Optionally include test framework output
 4. Run verification
 5. Review the detailed report
@@ -125,6 +118,19 @@ Simply select multiple video files when uploading, and the system will:
 - Extract frames from each video sequentially
 - Apply continuous timestamps across all videos
 - Analyze all frames as a unified timeline
+
+---
+
+## 📚 See Also
+
+For more details on the project, check out the following resources in the `analysis_agent/docs` folder:
+
+- 🎬 **Demo Video**: Watch a demonstration of Vigilant AI in action.
+  - [`Vigilant AI.mp4`](./analysis_agent/docs/Vigilant%20AI.mp4)
+- 🏗️ **Architecture**: A detailed breakdown of the system architecture.
+  - [`architecture.md`](./analysis_agent/docs/architecture.md)
+- 📊 **Sample Output**: An example of a generated report.
+  - [`Sample_run_output.html`](./analysis_agent/docs/Sample_run_output.html)
 
 ---
 
@@ -178,7 +184,7 @@ Vigilant AI uses a multi-agent system where each agent has a specialized role:
 | **PlanningAgent** | Analyzes test complexity, creates adaptive strategy | `create_strategy()` | 1 per analysis |
 | **ComprehensiveVisionAgent** | Single-pass video analysis, creates timeline | `analyze_video_comprehensive()` | 1 (key innovation) |
 | **OCRAgent** | Extracts text from frames using EasyOCR | `analyze_frames()` | 0 (uses EasyOCR) |
-| **VerificationAgent** | Semantic step verification, contradiction detection | `verify_step_with_timeline_evidence()` | 1-N (smart triage) |
+| **VerificationAgent** | Semantic verification & **Accuracy Auditing** | `verify_step_with_timeline_evidence()` | 1-N (smart triage) |
 
 ### Agent Descriptions
 

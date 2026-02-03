@@ -16,28 +16,44 @@ class PlanningLogParser:
         """Parse planning log from JSON content."""
         data = json.loads(content.decode('utf-8'))
         steps = []
+        is_audit = False
         
         # Extract steps from planner_agent messages
         if 'planner_agent' in data:
+            messages = data['planner_agent']
             step_number = 1
-            for message in data['planner_agent']:
+            
+            # Use index-based loop to look ahead for outcomes (audit mode compatibility)
+            for i in range(len(messages)):
+                message = messages[i]
+                
                 if message.get('role') == 'assistant' and 'content' in message:
-                    content = message['content']
+                    content_data = message['content']
                     
                     # Extract next_step and description
-                    next_step = content.get('next_step', '')
-                    summary = content.get('next_step_summary', '')
+                    next_step = content_data.get('next_step', '')
+                    summary = content_data.get('next_step_summary', '')
                     
                     if next_step:
+                        # Check if next message is a user message (the agent's outcome)
+                        outcome_text = None
+                        if i + 1 < len(messages):
+                            next_msg = messages[i+1]
+                            if next_msg.get('role') == 'user':
+                                outcome_text = next_msg.get('content', '')
+                                is_audit = True # Found agent observations, trigger Audit Mode
+                        
                         steps.append(TestStep(
                             step_number=step_number,
                             description=summary if summary else next_step,
                             action=next_step,
-                            expected_outcome=None
+                            expected_outcome=outcome_text
                         ))
                         step_number += 1
         
-        return PlanningLog(steps=steps, metadata={'raw_data': data})
+        return PlanningLog(steps=steps, metadata={'is_audit_mode': is_audit, 'raw_data': data})
+
+
 
 
 class TestOutputParser:

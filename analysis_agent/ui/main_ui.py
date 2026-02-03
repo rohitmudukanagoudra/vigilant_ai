@@ -296,10 +296,15 @@ if "error_retry_count" not in st.session_state:
     st.session_state.error_retry_count = 0
 
 def start_analysis_task(files):
-    """Sends files to the backend to start a new analysis task."""
+    """Sends files to the backend to start a new analysis task.
+    
+    Args:
+        files: List of tuples (field_name, (filename, data, content_type))
+               Supports multiple files with the same field name (e.g., multiple videos)
+    """
     try:
         with st.spinner("🚀 Uploading artifacts and initializing agents..."):
-            resp = requests.post(f"{API_URL}/analyze", files=files, timeout=60)
+            resp = requests.post(f"{API_URL}/analyze", files=files, timeout=120)
             resp.raise_for_status()
         
         st.session_state.task_id = resp.json()["task_id"]
@@ -353,8 +358,8 @@ with st.sidebar:
         st.session_state.uploaded_planning_log = None
     if "uploaded_test_output" not in st.session_state:
         st.session_state.uploaded_test_output = None
-    if "uploaded_video" not in st.session_state:
-        st.session_state.uploaded_video = None
+    if "uploaded_videos" not in st.session_state:
+        st.session_state.uploaded_videos = []
     
     # Check if we're in a state where uploads should be hidden (processing or completed)
     hide_uploads = st.session_state.status in ["processing", "completed"]
@@ -371,16 +376,16 @@ with st.sidebar:
         if test_output:
             st.session_state.uploaded_test_output = {"name": test_output.name, "data": test_output.getvalue()}
         
-        st.markdown("**🎥 Session Recording** (MP4/MOV)")
-        video = st.file_uploader("Upload Video", type=["mp4", "mov", "webm"], label_visibility="collapsed")
-        if video:
-            st.session_state.uploaded_video = {"name": video.name, "data": video.getvalue(), "type": video.type}
+        st.markdown("**🎥 Session Recordings** (MP4/MOV) - Multiple Allowed")
+        videos = st.file_uploader("Upload Videos", type=["mp4", "mov", "webm"], label_visibility="collapsed", accept_multiple_files=True)
+        if videos:
+            st.session_state.uploaded_videos = [{"name": v.name, "data": v.getvalue(), "type": v.type} for v in videos]
     
     # Show uploaded files info ONLY after clicking Start Analysis (processing or completed)
     if st.session_state.status in ["processing", "completed"]:
         has_files = (st.session_state.uploaded_planning_log is not None or
                      st.session_state.uploaded_test_output is not None or
-                     st.session_state.uploaded_video is not None)
+                     len(st.session_state.uploaded_videos) > 0)
         
         if has_files:
             st.markdown("""
@@ -391,10 +396,8 @@ with st.sidebar:
             files_html = ""
             if st.session_state.uploaded_planning_log:
                 files_html += f'<div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.5rem; background: rgba(102, 126, 234, 0.1); border-radius: 6px; margin-bottom: 0.4rem; font-size: 0.8rem;"><span>📋</span><span style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #a0aec0;">{st.session_state.uploaded_planning_log["name"]}</span><span style="color: #38ef7d;">✓</span></div>'
-            if st.session_state.uploaded_test_output:
-                files_html += f'<div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.5rem; background: rgba(102, 126, 234, 0.1); border-radius: 6px; margin-bottom: 0.4rem; font-size: 0.8rem;"><span>📊</span><span style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #a0aec0;">{st.session_state.uploaded_test_output["name"]}</span><span style="color: #38ef7d;">✓</span></div>'
-            if st.session_state.uploaded_video:
-                files_html += f'<div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.5rem; background: rgba(102, 126, 234, 0.1); border-radius: 6px; font-size: 0.8rem;"><span>🎥</span><span style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #a0aec0;">{st.session_state.uploaded_video["name"]}</span><span style="color: #38ef7d;">✓</span></div>'
+            for video in st.session_state.uploaded_videos:
+                files_html += f'<div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.5rem; background: rgba(102, 126, 234, 0.1); border-radius: 6px; margin-bottom: 0.4rem; font-size: 0.8rem;"><span>🎥</span><span style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #a0aec0;">{video["name"]}</span><span style="color: #38ef7d;">✓</span></div>'
             
             st.markdown(files_html + "</div>", unsafe_allow_html=True)
 
@@ -404,22 +407,24 @@ with st.sidebar:
     # Check if all files are uploaded
     all_files = (st.session_state.uploaded_planning_log is not None and
                  st.session_state.uploaded_test_output is not None and
-                 st.session_state.uploaded_video is not None)
+                 len(st.session_state.uploaded_videos) > 0)
     
     # Start Analysis Button - show at footer when idle and all files uploaded
     if all_files and st.session_state.status == "idle":
         if st.button("🚀 START ANALYSIS", key="sidebar_start"):
-            files = {
-                "planning_log": (st.session_state.uploaded_planning_log["name"],
+            # Build files list with multiple videos
+            files = [
+                ("planning_log", (st.session_state.uploaded_planning_log["name"],
                                st.session_state.uploaded_planning_log["data"],
-                               "application/json"),
-                "test_output": (st.session_state.uploaded_test_output["name"],
+                               "application/json")),
+                ("test_output", (st.session_state.uploaded_test_output["name"],
                               st.session_state.uploaded_test_output["data"],
-                              "application/xml"),
-                "video": (st.session_state.uploaded_video["name"],
-                         st.session_state.uploaded_video["data"],
-                         st.session_state.uploaded_video["type"]),
-            }
+                              "application/xml")),
+            ]
+            # Add all videos with the same field name for multipart handling
+            for video in st.session_state.uploaded_videos:
+                files.append(("videos", (video["name"], video["data"], video["type"])))
+            
             start_analysis_task(files)
     
     # Start New Analysis button - show at footer when completed
@@ -431,7 +436,7 @@ with st.sidebar:
             # Clear uploaded files
             st.session_state.uploaded_planning_log = None
             st.session_state.uploaded_test_output = None
-            st.session_state.uploaded_video = None
+            st.session_state.uploaded_videos = []
             st.rerun()
 
 

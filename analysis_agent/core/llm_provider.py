@@ -23,44 +23,64 @@ class GeminiProvider(LLMBase):
         self.vision_model_name = "gemini-2.5-flash"  # Use flash for multi-modal
         
     def generate(self, prompt: str, image_paths: Optional[List[str]] = None) -> str:
-        try:
-            model_to_use = self.vision_model_name if image_paths else self.model_name
-            print(f"DEBUG: Generating content with model {model_to_use}")
-            
-            contents = []
-            
-            if image_paths:
-                import PIL.Image
-                import io
-                for path in image_paths:
-                    if os.path.exists(path):
-                        img = PIL.Image.open(path)
-                        # Convert image to bytes
-                        img_byte_arr = io.BytesIO()
-                        img.save(img_byte_arr, format=img.format or 'PNG')
-                        img_bytes = img_byte_arr.getvalue()
-                        contents.append(types.Part.from_bytes(data=img_bytes, mime_type=f"image/{(img.format or 'PNG').lower()}"))
+        max_retries = 5
+        base_delay = 5  # Start with 5 seconds for 429s
+        
+        for attempt in range(max_retries + 1):
+            try:
+                model_to_use = self.vision_model_name if image_paths else self.model_name
+                if attempt > 0:
+                    print(f"DEBUG: Retry attempt {attempt}/{max_retries} with model {model_to_use}")
+                else:
+                    print(f"DEBUG: Generating content with model {model_to_use}")
+                
+                contents = []
+                
+                if image_paths:
+                    import PIL.Image
+                    import io
+                    for path in image_paths:
+                        if os.path.exists(path):
+                            img = PIL.Image.open(path)
+                            # Convert image to bytes
+                            img_byte_arr = io.BytesIO()
+                            img.save(img_byte_arr, format=img.format or 'PNG')
+                            img_bytes = img_byte_arr.getvalue()
+                            contents.append(types.Part.from_bytes(data=img_bytes, mime_type=f"image/{(img.format or 'PNG').lower()}"))
+                        else:
+                            print(f"Warning: Image not found at {path}")
+                
+                contents.append(prompt)
+                
+                response = self.client.models.generate_content(
+                    model=model_to_use,
+                    contents=contents
+                )
+                
+                # Check for empty response
+                if not response.text:
+                    print(f"DEBUG: Empty response received")
+                    return "{}"  # Return empty JSON compatible string if blocked
+                
+                print(f"DEBUG: Response text prefix: {response.text[:100]}")
+                return response.text
+                
+            except Exception as e:
+                error_str = str(e)
+                # Check for rate limit errors (429 or RESOURCE_EXHAUSTED)
+                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    if attempt < max_retries:
+                        delay = base_delay * (2 ** attempt)  # Exponential backoff: 5, 10, 20, 40, 80
+                        print(f"WARNING: Rate limit hit (429). Retrying in {delay}s...")
+                        import time
+                        time.sleep(delay)
+                        continue
                     else:
-                        print(f"Warning: Image not found at {path}")
-            
-            contents.append(prompt)
-            
-            response = self.client.models.generate_content(
-                model=model_to_use,
-                contents=contents
-            )
-            
-            # Check for empty response
-            if not response.text:
-                print(f"DEBUG: Empty response received")
-                return "{}"  # Return empty JSON compatible string if blocked
-            
-            print(f"DEBUG: Response text prefix: {response.text[:100]}")
-            return response.text
-        except Exception as e:
-            # Fallback or error handling
-            print(f"ERROR in GeminiProvider: {e}")
-            return f"Error generating content: {str(e)}"
+                        print(f"ERROR: Max retries exhausted for rate limit.")
+                
+                # For other errors or if max retries reached
+                print(f"ERROR in GeminiProvider: {e}")
+                return f"Error generating content: {str(e)}"
 
 class EncapsulatedCLIProvider(LLMBase):
     """Provider that wraps a CLI tool (e.g., Gemini CLI or custom wrapper)."""

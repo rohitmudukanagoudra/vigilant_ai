@@ -14,6 +14,7 @@ Key Features:
 import asyncio
 import json
 from typing import List, Dict, Any, Tuple, Optional
+from analysis_agent.utils.json_utils import try_parse_json
 
 from analysis_agent.agents.base_agent import BaseAgent
 from analysis_agent.core.models import (
@@ -149,7 +150,8 @@ class VerificationAgent(BaseAgent):
         step: TestStep,
         evidence: StepEvidence,
         previous_results: List[VerificationResult],
-        timeline_narrative: str
+        timeline_narrative: str,
+        is_audit: bool = False
     ) -> VerificationResult:
         """
         Perform LLM-based semantic verification of a single step.
@@ -162,18 +164,20 @@ class VerificationAgent(BaseAgent):
             evidence: Initial evidence from timeline matching
             previous_results: Results of previously verified steps (for context)
             timeline_narrative: Overall timeline narrative for context
+            is_audit: Whether to run in Audit Mode (verifying agent accuracy)
             
         Returns:
             VerificationResult with LLM-determined status
         """
-        self.logger.info(f"🔍 LLM verifying step {step.step_number}: {step.description[:50]}...")
+        self.logger.info(f"🔍 LLM {'auditing' if is_audit else 'verifying'} step {step.step_number}: {step.description[:50]}...")
         
         # Build prompt with context
         prompt = self._create_verification_prompt(
             step=step,
             evidence=evidence,
             previous_results=previous_results,
-            timeline_narrative=timeline_narrative
+            timeline_narrative=timeline_narrative,
+            is_audit=is_audit
         )
         
         try:
@@ -200,7 +204,8 @@ class VerificationAgent(BaseAgent):
         self,
         steps_to_verify: List[Tuple[TestStep, StepEvidence]],
         previous_results: List[VerificationResult],
-        timeline_narrative: str
+        timeline_narrative: str,
+        is_audit: bool = False
     ) -> List[VerificationResult]:
         """
         Batch verify multiple steps in a single LLM call.
@@ -212,6 +217,7 @@ class VerificationAgent(BaseAgent):
             steps_to_verify: List of (step, evidence) tuples to verify
             previous_results: Results of code-verified steps (for context)
             timeline_narrative: Overall timeline narrative
+            is_audit: Whether to run in Audit Mode
             
         Returns:
             List of VerificationResults for each step
@@ -219,13 +225,14 @@ class VerificationAgent(BaseAgent):
         if not steps_to_verify:
             return []
         
-        self.logger.info(f"🔍 Batch LLM verifying {len(steps_to_verify)} steps...")
+        self.logger.info(f"🔍 Batch LLM {'auditing' if is_audit else 'verifying'} {len(steps_to_verify)} steps...")
         
         # Build batch prompt
         prompt = self._create_batch_verification_prompt(
             steps_to_verify=steps_to_verify,
             previous_results=previous_results,
-            timeline_narrative=timeline_narrative
+            timeline_narrative=timeline_narrative,
+            is_audit=is_audit
         )
         
         try:
@@ -258,7 +265,8 @@ class VerificationAgent(BaseAgent):
         step: TestStep,
         evidence: StepEvidence,
         previous_results: List[VerificationResult],
-        timeline_narrative: str
+        timeline_narrative: str,
+        is_audit: bool = False
     ) -> str:
         """Create LLM prompt for single step verification."""
         
@@ -268,6 +276,47 @@ class VerificationAgent(BaseAgent):
         # Format matching events
         events_summary = self._format_matching_events(evidence.matching_events[:3])
         
+        if is_audit:
+            return f"""You are a test audit expert. Your goal is to verify if the Agent's internal reporting is ACCURATE based on the video evidence.
+
+**Audit Goal:**
+The Agent has performed a step and reported its observation. You must determine if the video CONFIRMS or CONTRADICTS what the agent said.
+
+**Test Step #{step.step_number}:**
+- Planned Action: {step.action}
+- **Agent's Internal Claim/Observation:** {step.expected_outcome}
+
+**Timeline Evidence (from video analysis):**
+- Video Data Found: {evidence.found}
+- Evidence Description: {evidence.description}
+- Evidence Reasoning: {evidence.reasoning}
+
+**Matching Timeline Events:**
+{events_summary}
+
+**Overall Video Narrative:**
+{timeline_narrative[:500]}...
+
+---
+
+**Decision Rules for AUDIT MODE:**
+- **OBSERVED**: The video evidence MATCHES the Agent's report. 
+  - *Example: Agent said 'Filter was missing', video shows filter was missing. (MATCH!)*
+  - *Example: Agent said 'Successfully clicked', video shows click happened. (MATCH!)*
+- **DEVIATION**: The video evidence CONTRADICTS the Agent's report.
+  - *Example: Agent said 'Successfully clicked', but video shows no click happened. (CONTRADICTION!)*
+  - *Example: Agent said 'Filter was missing', but video shows the filter was clearly visible. (CONTRADICTION!)*
+- **UNCERTAIN**: Inconclusive evidence.
+
+Respond ONLY with valid JSON:
+{{
+    "status": "observed|deviation|uncertain",
+    "confidence": 0.0-1.0,
+    "reasoning": "Explain why the agent's report is accurate or inaccurate compared to the video.",
+    "contradiction_detected": true|false,
+    "contradiction_details": "Quote where the agent's report conflicts with video reality, or null if accurate"
+}}"""
+
         return f"""You are a test verification expert. Determine if this test step PASSED or FAILED.
 
 **CRITICAL: Detect False Positives**
@@ -323,7 +372,8 @@ Respond ONLY with valid JSON (no markdown, no extra text):
         self,
         steps_to_verify: List[Tuple[TestStep, StepEvidence]],
         previous_results: List[VerificationResult],
-        timeline_narrative: str
+        timeline_narrative: str,
+        is_audit: bool = False
     ) -> str:
         """Create LLM prompt for batch step verification."""
         
@@ -334,7 +384,16 @@ Respond ONLY with valid JSON (no markdown, no extra text):
         steps_section = ""
         for i, (step, evidence) in enumerate(steps_to_verify, 1):
             events_summary = self._format_matching_events(evidence.matching_events[:2])
-            steps_section += f"""
+            if is_audit:
+                steps_section += f"""
+--- STEP {step.step_number} ---
+Planned Action: {step.action}
+Agent's Claim/Observation: {step.expected_outcome}
+Video Evidence Description: {evidence.description}
+Video Evidence Reasoning: {evidence.reasoning}
+"""
+            else:
+                steps_section += f"""
 --- STEP {step.step_number} ---
 Description: {step.description}
 Action: {step.action}
@@ -345,6 +404,35 @@ Evidence Reasoning: {evidence.reasoning}
 Matching Events: {events_summary}
 """
         
+        if is_audit:
+            return f"""You are a test audit expert. Verify if the Agent's internal reporting for these steps is ACCURATE based on the video evidence.
+
+**Audit Objective:**
+Check if the Agent's "Claim/Observation" for each step is confirmed or contradicted by the "Video Evidence".
+
+**Decision Rules:**
+- **OBSERVED**: Agent report MATCHES video (e.g., both say 'failed', or both say 'success').
+- **DEVIATION**: Agent report CONTRADICTS video (e.g., agent says 'success' but video shows 'failure').
+
+**Video Timeline Narrative:**
+{timeline_narrative[:400]}...
+
+**STEPS TO AUDIT:**
+{steps_section}
+
+Respond ONLY with valid JSON array:
+[
+    {{
+        "step_number": [num],
+        "status": "observed|deviation|uncertain",
+        "confidence": 0.0-1.0,
+        "reasoning": "Analysis of agent accuracy",
+        "contradiction_detected": true|false,
+        "contradiction_details": "Exact conflict text or null"
+    }},
+    ...
+]"""
+
         return f"""You are a test verification expert. Analyze MULTIPLE test steps and determine if each PASSED or FAILED.
 
 **CRITICAL: Detect False Positives**
@@ -412,9 +500,11 @@ Respond ONLY with valid JSON array (no markdown):
     ) -> VerificationResult:
         """Parse LLM response for single step verification."""
         try:
-            # Clean response
-            cleaned = self._clean_json_response(response_text)
-            data = json.loads(cleaned)
+            # Parse with robust repair
+            data = try_parse_json(response_text)
+            
+            if not data or not isinstance(data, dict):
+                raise ValueError("Could not parse response as JSON dictionary")
             
             # Extract fields
             status_str = data.get("status", "uncertain").lower()
@@ -468,11 +558,10 @@ Respond ONLY with valid JSON array (no markdown):
     ) -> List[VerificationResult]:
         """Parse LLM response for batch step verification."""
         try:
-            # Clean response
-            cleaned = self._clean_json_response(response_text)
-            data_list = json.loads(cleaned)
+            # Parse with robust repair
+            data_list = try_parse_json(response_text)
             
-            if not isinstance(data_list, list):
+            if not data_list or not isinstance(data_list, list):
                 raise ValueError("Expected JSON array")
             
             results = []
@@ -532,39 +621,6 @@ Respond ONLY with valid JSON array (no markdown):
                 for step, evidence in steps_to_verify
             ]
     
-    def _clean_json_response(self, response_text: str) -> str:
-        """Clean LLM response to extract JSON."""
-        import re
-        
-        if not response_text or not response_text.strip():
-            raise ValueError("Empty response from LLM")
-        
-        text = response_text.strip()
-        
-        # Remove markdown code blocks
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
-        
-        # Find JSON start/end
-        if "[" in text and (text.find("[") < text.find("{") or "{" not in text):
-            start = text.find("[")
-            end = text.rfind("]") + 1
-        else:
-            start = text.find("{")
-            end = text.rfind("}") + 1
-        
-        if start >= 0 and end > start:
-            text = text[start:end]
-        
-        # Fix single quotes to double quotes for JSON keys/values
-        text = re.sub(r"(?<![\\])'", '"', text)
-        
-        # Remove trailing commas
-        text = re.sub(r',\s*([}\]])', r'\1', text)
-        
-        return text
     
     def _create_fallback_result(
         self,

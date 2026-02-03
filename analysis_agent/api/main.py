@@ -11,7 +11,7 @@ from pathlib import Path
 import tempfile
 import shutil
 from datetime import datetime
-from typing import Dict
+from typing import Dict, List
 import uuid
 
 from analysis_agent.core.config import get_settings
@@ -87,7 +87,7 @@ async def health_check():
 async def analyze(
     planning_log: UploadFile = File(...),
     test_output: UploadFile = File(...),
-    video: UploadFile = File(...),
+    videos: List[UploadFile] = File(...),
     background_tasks: BackgroundTasks = None
 ):
     """
@@ -96,7 +96,7 @@ async def analyze(
     Args:
         planning_log: Agent planning log JSON file
         test_output: Test output XML file
-        video: Video recording file
+        videos: List of video recording files (supports multiple videos)
         
     Returns:
         Task ID for tracking progress
@@ -110,8 +110,16 @@ async def analyze(
         progress=0.0,
         phase="pending",
         current_step="Initializing",
-        message="Task created, waiting to start..."
+        message=f"Task created with {len(videos)} video(s), waiting to start..."
     )
+    
+    # Read all video contents
+    video_data = []
+    for video in videos:
+        video_data.append({
+            "content": await video.read(),
+            "filename": video.filename
+        })
     
     # Start analysis in background
     background_tasks.add_task(
@@ -119,18 +127,17 @@ async def analyze(
         task_id,
         await planning_log.read(),
         await test_output.read(),
-        await video.read(),
+        video_data,
         planning_log.filename,
-        test_output.filename,
-        video.filename
+        test_output.filename
     )
     
-    logger.info(f"Created analysis task: {task_id}")
+    logger.info(f"Created analysis task: {task_id} with {len(videos)} video(s)")
     
     return {
         "task_id": task_id,
         "status": "created",
-        "message": "Analysis task started"
+        "message": f"Analysis task started with {len(videos)} video(s)"
     }
 
 
@@ -237,12 +244,20 @@ async def run_analysis(
     task_id: str,
     planning_log_content: bytes,
     test_output_content: bytes,
-    video_content: bytes,
+    video_data: List[Dict],
     planning_log_filename: str,
-    test_output_filename: str,
-    video_filename: str
+    test_output_filename: str
 ):
-    """Run analysis in background."""
+    """Run analysis in background with support for multiple videos.
+    
+    Args:
+        task_id: Unique task identifier
+        planning_log_content: Raw bytes of planning log JSON
+        test_output_content: Raw bytes of test output XML
+        video_data: List of dicts with 'content' (bytes) and 'filename' (str) for each video
+        planning_log_filename: Original filename of planning log
+        test_output_filename: Original filename of test output
+    """
     start_time = datetime.now()
     
     def update_progress(progress: TaskProgress):
@@ -258,16 +273,21 @@ async def run_analysis(
             progress=0.0,
             phase="parsing",
             current_step="Parsing",
-            message="Parsing input files..."
+            message=f"Parsing input files... ({len(video_data)} video(s))"
         ))
         
         # Create temp directory for this task
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             
-            # Save files
-            video_path = temp_path / video_filename
-            video_path.write_bytes(video_content)
+            # Save all video files
+            video_paths = []
+            for video in video_data:
+                video_path = temp_path / video["filename"]
+                video_path.write_bytes(video["content"])
+                video_paths.append(video_path)
+            
+            logger.info(f"Task {task_id}: Saved {len(video_paths)} video file(s)")
             
             # Parse inputs
             planning_log = PlanningLogParser.parse(planning_log_content)
@@ -275,11 +295,11 @@ async def run_analysis(
             
             logger.info(f"Task {task_id}: Parsed {len(planning_log.steps)} steps")
             
-            # Run orchestrator
+            # Run orchestrator with multiple videos
             report = await orchestrator.execute_verification(
                 planning_log=planning_log,
                 test_output=test_output,
-                video_path=video_path,
+                video_paths=video_paths,
                 temp_dir=temp_path,
                 progress_callback=update_progress
             )
@@ -290,9 +310,11 @@ async def run_analysis(
             html_report = report_gen.generate_html(report)
             markdown_report = report_gen.generate_markdown(report)
             
-            # Count frames
+            # Count frames from all frame directories
+            frames_extracted = 0
             frames_dir = temp_path / "frames"
-            frames_extracted = len(list(frames_dir.glob("*.jpg"))) if frames_dir.exists() else 0
+            if frames_dir.exists():
+                frames_extracted = len(list(frames_dir.glob("*.jpg")))
             
             # Store result
             processing_time = (datetime.now() - start_time).total_seconds()
@@ -314,11 +336,11 @@ async def run_analysis(
                 progress=1.0,
                 phase="complete",
                 current_step="Complete",
-                message=f"Analysis completed in {processing_time:.1f}s"
+                message=f"Analysis completed in {processing_time:.1f}s ({len(video_paths)} video(s) processed)"
             )
             update_progress(final_progress)
             
-            logger.info(f"Task {task_id}: Completed successfully")
+            logger.info(f"Task {task_id}: Completed successfully with {len(video_paths)} video(s)")
     
     except Exception as e:
         logger.error(f"Task {task_id}: Failed with error: {e}", exc_info=True)

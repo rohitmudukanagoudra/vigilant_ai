@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import re
+from analysis_agent.utils.json_utils import try_parse_json
 
 
 from analysis_agent.agents.base_agent import BaseAgent
@@ -341,12 +342,11 @@ Analyze now and provide the comprehensive timeline."""
             if not cleaned_text.endswith("}") and "}" in cleaned_text:
                 cleaned_text = cleaned_text[:cleaned_text.rfind("}")+1]
             
-            # Try parsing JSON, with repair attempts on failure
-            data = self._try_parse_json_with_repair(cleaned_text)
+            # Using robust repair from json_utils
+            data = try_parse_json(cleaned_text)
             
             if data is None:
                 self.logger.error("All JSON parsing attempts failed")
-                self.logger.debug(f"Response text (first 1000 chars): {response_text[:1000]}...")
                 return self._create_empty_timeline(key_frames)
             
             # Create timeline events
@@ -376,231 +376,8 @@ Analyze now and provide the comprehensive timeline."""
             self.logger.error(f"Failed to parse timeline response: {e}", exc_info=True)
             return self._create_empty_timeline(key_frames)
     
-    def _try_parse_json_with_repair(self, json_text: str) -> Optional[Dict[str, Any]]:
-        """
-        Try to parse JSON with multiple repair strategies.
-        
-        Strategies:
-        1. Direct parsing
-        2. Fix common syntax errors (trailing commas, missing commas)
-        3. Extract and parse individual components
-        
-        Returns:
-            Parsed dict or None if all attempts fail
-        """
-        # Strategy 1: Direct parsing
-        try:
-            return json.loads(json_text)
-        except json.JSONDecodeError as e:
-            self.logger.warning(f"Direct JSON parse failed: {e}")
-        
-        # Strategy 2: Fix common JSON syntax errors
-        repaired_text = self._repair_json_syntax(json_text)
-        try:
-            return json.loads(repaired_text)
-        except json.JSONDecodeError as e:
-            self.logger.warning(f"Repaired JSON parse failed: {e}")
-        
-        # Strategy 3: Try to extract events array separately and build partial result
-        try:
-            partial_result = self._extract_partial_json(json_text)
-            if partial_result and (partial_result.get("events") or partial_result.get("narrative")):
-                self.logger.info("Recovered partial JSON data")
-                return partial_result
-        except Exception as e:
-            self.logger.warning(f"Partial JSON extraction failed: {e}")
-        
-        # Strategy 4: Try truncating at the last valid JSON structure
-        try:
-            truncated = self._truncate_to_valid_json(json_text)
-            if truncated:
-                return json.loads(truncated)
-        except Exception as e:
-            self.logger.warning(f"Truncated JSON parse failed: {e}")
-        
-        return None
     
-    def _repair_json_syntax(self, json_text: str) -> str:
-        """
-        Attempt to repair common JSON syntax errors.
-        
-        Fixes:
-        - Trailing commas before ] or }
-        - Missing commas between elements
-        - Unescaped quotes in strings
-        - Truncated strings at end
-        """
-        repaired = json_text
-        
-        # Fix trailing commas: ,] -> ] and ,} -> }
-        repaired = re.sub(r',\s*]', ']', repaired)
-        repaired = re.sub(r',\s*}', '}', repaired)
-        
-        # Fix missing commas between objects: }{ -> },{
-        repaired = re.sub(r'}\s*{', '},{', repaired)
-        
-        # Fix missing commas between array elements: ]\s*[ -> ],[
-        repaired = re.sub(r']\s*\[', '],[', repaired)
-        
-        # Fix missing commas after string values: "value"\s*" -> "value","
-        repaired = re.sub(r'"\s*\n\s*"', '",\n"', repaired)
-        
-        # Fix missing commas after numbers: digits\s*" -> digits,"
-        repaired = re.sub(r'(\d)\s*\n\s*"', r'\1,\n"', repaired)
-        
-        # Fix missing commas after true/false/null
-        repaired = re.sub(r'(true|false|null)\s*\n\s*"', r'\1,\n"', repaired)
-        
-        # Ensure proper closing if truncated
-        open_braces = repaired.count('{') - repaired.count('}')
-        open_brackets = repaired.count('[') - repaired.count(']')
-        
-        # If we have unclosed structures, try to close them
-        if open_braces > 0 or open_brackets > 0:
-            # Remove potentially incomplete last element
-            # Find the last complete element
-            last_complete = max(
-                repaired.rfind('},'),
-                repaired.rfind('"],'),
-                repaired.rfind('"}'),
-                repaired.rfind('"]'),
-            )
-            if last_complete > len(repaired) // 2:
-                repaired = repaired[:last_complete + 2]
-                # Re-count and close
-                open_braces = repaired.count('{') - repaired.count('}')
-                open_brackets = repaired.count('[') - repaired.count(']')
-            
-            # Close unclosed brackets first, then braces
-            repaired += ']' * open_brackets
-            repaired += '}' * open_braces
-        
-        return repaired
     
-    def _extract_partial_json(self, json_text: str) -> Optional[Dict[str, Any]]:
-        """
-        Extract what we can from partially valid JSON.
-        
-        Tries to extract:
-        - narrative field
-        - key_observations array
-        - events array (as many as possible)
-        """
-        result = {
-            "narrative": "",
-            "key_observations": [],
-            "events": []
-        }
-        
-        # Extract narrative
-        narrative_match = re.search(r'"narrative"\s*:\s*"([^"]*(?:\\.[^"]*)*)"', json_text)
-        if narrative_match:
-            result["narrative"] = narrative_match.group(1).replace('\\"', '"')
-        
-        # Extract key_observations - find the array content
-        obs_match = re.search(r'"key_observations"\s*:\s*\[(.*?)\]', json_text, re.DOTALL)
-        if obs_match:
-            obs_content = obs_match.group(1)
-            # Extract individual strings
-            observations = re.findall(r'"([^"]*(?:\\.[^"]*)*)"', obs_content)
-            result["key_observations"] = [o.replace('\\"', '"') for o in observations]
-        
-        # Extract events - this is more complex, extract individual event objects
-        events_match = re.search(r'"events"\s*:\s*\[(.*)', json_text, re.DOTALL)
-        if events_match:
-            events_content = events_match.group(1)
-            # Find complete event objects using balanced brace matching
-            events = self._extract_json_objects(events_content)
-            for event_str in events:
-                try:
-                    event_data = json.loads(event_str)
-                    result["events"].append(event_data)
-                except:
-                    continue
-        
-        return result if (result["events"] or result["narrative"]) else None
-    
-    def _extract_json_objects(self, text: str) -> List[str]:
-        """Extract complete JSON objects from text using brace matching."""
-        objects = []
-        depth = 0
-        start = -1
-        
-        for i, char in enumerate(text):
-            if char == '{':
-                if depth == 0:
-                    start = i
-                depth += 1
-            elif char == '}':
-                depth -= 1
-                if depth == 0 and start >= 0:
-                    obj_str = text[start:i+1]
-                    objects.append(obj_str)
-                    start = -1
-        
-        return objects
-    
-    def _truncate_to_valid_json(self, json_text: str) -> Optional[str]:
-        """
-        Try to find a valid JSON by progressively truncating.
-        
-        This handles cases where the LLM response was cut off mid-JSON.
-        """
-        # Try to find the last complete event in the events array
-        # Look for patterns like: }, followed by ] to close events array
-        
-        # First, find where events array starts
-        events_start = json_text.find('"events"')
-        if events_start < 0:
-            return None
-        
-        # Find complete event objects
-        events_array_start = json_text.find('[', events_start)
-        if events_array_start < 0:
-            return None
-        
-        # Find all potential end points (complete events)
-        potential_ends = []
-        depth = 0
-        in_events = False
-        
-        for i, char in enumerate(json_text[events_array_start:], events_array_start):
-            if char == '[' and not in_events:
-                in_events = True
-                depth = 1
-            elif char == '{':
-                depth += 1
-            elif char == '}':
-                depth -= 1
-                if depth == 1:  # Just closed an event object
-                    potential_ends.append(i)
-            elif char == ']' and depth == 1:
-                # Found the end of events array
-                break
-        
-        # Try truncating at each potential end point, from last to first
-        for end_pos in reversed(potential_ends):
-            try:
-                # Build truncated JSON: keep everything up to this event, close arrays/objects
-                truncated = json_text[:end_pos + 1]
-                
-                # Count unclosed structures
-                open_brackets = truncated.count('[') - truncated.count(']')
-                open_braces = truncated.count('{') - truncated.count('}')
-                
-                # Close them
-                truncated += ']' * open_brackets
-                truncated += '}' * open_braces
-                
-                # Verify it parses
-                result = json.loads(truncated)
-                if result.get("events"):
-                    self.logger.info(f"Successfully truncated JSON at position {end_pos}, recovered {len(result.get('events', []))} events")
-                    return truncated
-            except:
-                continue
-        
-        return None
     
     def _create_empty_timeline(self, key_frames: List[VideoFrame]) -> VideoTimeline:
         """Create empty timeline on parsing failure."""
