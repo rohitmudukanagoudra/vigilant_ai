@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="ui/images/Vigilant AI logo.png" alt="Vigilant AI Logo" width="200"/>
+  <img src="analysis_agent/ui/images/Vigilant AI logo.png" alt="Vigilant AI Logo" width="200"/>
 </p>
 
 <h1 align="center">Vigilant AI</h1>
